@@ -193,7 +193,7 @@ def build_vit(
             patch_size     = patch_size,
             mlp_drop_rate  = mlp_drop_rate,
             attn_drop_rate = attn_drop_rate,
-            name           = 'Transformer_{:2d}'.format(i+1)
+            name           = 'Transformer_{:02}'.format(i+1)
         )(patch_enc)
 
     # final
@@ -305,6 +305,6 @@ def ViT_L32(
         classes     = classes,
         **dict(**vitL_conf, **{'patch_size':32}))
 
-
-model = ViT_B16(256, 3, 2)
-model.summary()
+if not __debug__:
+    model = ViT_S32(256, 3, 20)
+    model.summary()
