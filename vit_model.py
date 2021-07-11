@@ -58,6 +58,7 @@ class Encoder(layers.Layer):
         self.hidden_dim = hidden_dim
 
     def build(self, input_shape):
+        num_patch = (input_shape[1] * input_shape[2]) // (self.patch_size**2)
         # weight
         self.patch_weight = self.add_weight(
             name  = 'patch_posemb',
@@ -65,7 +66,7 @@ class Encoder(layers.Layer):
         )
         self.emb_weight = self.add_weight(
             name  = 'patch_emb',
-            shape = (1, self.patch_size**2 + 1, self.hidden_dim)
+            shape = (1, num_patch + 1, self.hidden_dim)
         )
 
         # layer
@@ -76,7 +77,7 @@ class Encoder(layers.Layer):
             name        = 'patch_conv2d'
         )
         self.reshape = layers.Reshape(
-            target_shape = (self.patch_size**2, self.hidden_dim),
+            target_shape = (num_patch, self.hidden_dim),
             name         = 'patch_reshape'
         )
 
@@ -259,7 +260,7 @@ def ViT_S32(
         image_size  = image_size,
         channels    = channels,
         classes     = classes,
-        **dict(**vitS_conf, **{'patch_size':32}))
+        **dict(vitS_conf, **{'patch_size':32}))
 
 
 def ViT_B16(
@@ -281,7 +282,7 @@ def ViT_B32(
         image_size  = image_size,
         channels    = channels,
         classes     = classes,
-        **dict(**vitB_conf, **{'patch_size':32}))
+        **dict(vitB_conf, **{'patch_size':32}))
 
 
 def ViT_L16(
@@ -303,8 +304,9 @@ def ViT_L32(
         image_size  = image_size,
         channels    = channels,
         classes     = classes,
-        **dict(**vitL_conf, **{'patch_size':32}))
+        **dict(vitL_conf, **{'patch_size':32}))
+
 
 if not __debug__:
-    model = ViT_S32(256, 3, 20)
+    model = ViT_L32(256, 3, 20)
     model.summary()
