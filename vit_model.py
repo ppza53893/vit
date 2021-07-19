@@ -1,7 +1,12 @@
+import os, warnings
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+warnings.simplefilter('ignore')
+
 import tensorflow as tf
 
-from tensorflow.keras import layers
-from tensorflow.keras import Model
+from tensorflow.python.keras import layers
+from tensorflow.python.keras import Model
 
 
 class MLP(layers.Layer):
@@ -17,7 +22,7 @@ class MLP(layers.Layer):
         self.drop_rate      = drop_rate
         self.hidden_dim     = hidden_dim
         self.hidden_dim_mlp = hidden_dim_mlp
-    
+
     def build(self, input_shape):
         self.dense1 = layers.Dense(
             units      = self.hidden_dim_mlp,
@@ -45,31 +50,20 @@ class MLP(layers.Layer):
         return x
 
 
-class Encoder(layers.Layer):
-    """Patch Encoder"""
+class Patch(layers.Layer):
     def __init__(
         self,
         patch_size: int,
         hidden_dim: int,
         **kwargs) -> None:
-        super(Encoder, self).__init__(**kwargs)
+        super(Patch, self).__init__(**kwargs)
 
         self.patch_size = patch_size
         self.hidden_dim = hidden_dim
-
+    
     def build(self, input_shape):
         num_patch = (input_shape[1] * input_shape[2]) // (self.patch_size**2)
-        # weight
-        self.patch_weight = self.add_weight(
-            name  = 'patch_posemb',
-            shape = (1, 1, self.hidden_dim)
-        )
-        self.emb_weight = self.add_weight(
-            name  = 'patch_emb',
-            shape = (1, num_patch + 1, self.hidden_dim)
-        )
 
-        # layer
         self.conv = layers.Conv2D(
             filters     = self.hidden_dim,
             kernel_size = self.patch_size,
@@ -80,23 +74,123 @@ class Encoder(layers.Layer):
             target_shape = (num_patch, self.hidden_dim),
             name         = 'patch_reshape'
         )
+    
+    def call(self, inputs):
+        x = self.conv(inputs)
+        x = self.reshape(x)
+
+        return x
+
+
+class Encoder(layers.Layer):
+    """Patch & Embedding"""
+    def __init__(
+        self,
+        image_size: int,
+        patch_size: int,
+        hidden_dim: int,
+        **kwargs) -> None:
+        super(Encoder, self).__init__(**kwargs)
+
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.hidden_dim = hidden_dim
+
+    def build(self, input_shape):
+        num_patch = (self.image_size // self.patch_size)**2
+
+        # weight
+        self.patch_weight = self.add_weight(
+            name        = 'patch_posemb',
+            shape       = (1, 1, self.hidden_dim),
+            initializer = tf.keras.initializers.zeros()
+        )
+        self.emb_weight = self.add_weight(
+            name        = 'patch_emb',
+            shape       = (1, num_patch + 1, self.hidden_dim),
+            initializer = tf.keras.initializers.random_normal(stddev = 0.02)
+        )
 
     def call(self, inputs):
         batch_size = tf.shape(inputs)[0]
-        patch_weight = tf.repeat(
+        patch_weight = tf.broadcast_to(
             input   = self.patch_weight,
-            repeats = batch_size,
-            axis    = 0
+            shape   = [batch_size, 1, self.hidden_dim],
         )
-
-        x = self.conv(inputs)
-        x = self.reshape(x)
         x = layers.Concatenate(
             axis = 1,
-            name = 'patch_posemb_concat')([x, patch_weight])
+            name = 'patch_posemb_concat')([patch_weight, inputs])
         x = layers.Add(
             name = 'patch_patchemb_add')([x, self.emb_weight])
         return x
+
+
+class MultiHeadSelfAttention(layers.Layer):
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_heads: int,
+        drop_rate: float = 0.,
+        **kwargs):
+        super().__init__(**kwargs)
+
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.drop_rate = drop_rate
+    
+    def build(self, input_shape):      
+        # Dense
+        self.d_query = layers.Dense(self.hidden_dim, name='MHA_query')
+        self.d_key = layers.Dense(self.hidden_dim, name='MHA_query')
+        self.d_value = layers.Dense(self.hidden_dim, name='MHA_query')
+
+        # Reshape
+        self.reshape = layers.Reshape(
+                target_shape=(-1, self.num_heads, self.hidden_dim//self.num_heads))
+        # Perm
+        self.perm = layers.Permute(dims = (2,1,3))
+
+        # softmax
+        self.softmax = layers.Activation(activation = 'softmax', name = 'qkt_softmax')
+
+        # dropout
+        self.dropout = layers.Dropout(rate = self.drop_rate)
+
+        # for output
+        self.reshape_f = layers.Reshape(target_shape = (-1, self.hidden_dim))
+        self.dense = layers.Dense(units = self.hidden_dim)
+
+    def reshape_and_perm(self, inputs):
+        x = self.reshape(inputs)
+        return self.perm(x)
+
+    def call(self, inputs):
+        # Dense
+        query = self.reshape_and_perm(self.d_query(inputs))
+        key = self.reshape_and_perm(self.d_key(inputs))
+        value = self.reshape_and_perm(self.d_value(inputs))
+
+        # qkt = QK^T
+        qkt = tf.matmul(a = query, b = key, transpose_b = True)
+
+        # qkt = softmax(qkt/sqrt(dim))
+        d_k = tf.cast(self.hidden_dim, dtype=qkt.dtype)
+        qkt = self.softmax(qkt / tf.sqrt(d_k))
+
+        # dropout
+        qkt = self.dropout(qkt)
+
+        # qktV
+        attn = tf.matmul(qkt, value)
+
+        # [Batch, num_heads, patch^2+1, dim // num_heads] -> [Batch, patch^2+1, dim]
+        attn = self.perm(attn)
+        attn = self.reshape_f(attn)
+
+        # final dense
+        out = self.dense(attn)
+
+        return out
 
 
 class Transformer(layers.Layer):
@@ -124,11 +218,11 @@ class Transformer(layers.Layer):
             epsilon = 1e-06,
             name    = 'transformer_layernorm_1'
         )
-        self.mha = layers.MultiHeadAttention(
-            num_heads = self.num_heads,
-            key_dim   = self.hidden_dim,
-            dropout   = self.attn_drop_rate,
-            name      = 'transformer_multihedattension'
+        self.mha = MultiHeadSelfAttention(
+            hidden_dim = self.hidden_dim,
+            num_heads  = self.num_heads,
+            drop_rate  = self.attn_drop_rate,
+            name       = 'transformer_multiheadattension'
         )
         self.layernorm2 = layers.LayerNormalization(
             epsilon = 1e-06,
@@ -143,7 +237,7 @@ class Transformer(layers.Layer):
 
     def call(self, inputs):
         x = self.layernorm1(inputs)
-        x = self.mha(x, x)
+        x = self.mha(x)
         x = layers.Add(name='transformer_MHA_add')([inputs, x])
 
         y = self.layernorm2(x)
@@ -152,10 +246,12 @@ class Transformer(layers.Layer):
         x = layers.Add(name='transformer_MLP_add')([x, y])
         return x
 
-class Pop(layers.Layer):
-    """Partial layer"""
+
+class MLPHead(layers.Layer):
+    """MLPHead layer"""
     def call(self, inputs):
         return inputs[:,0]
+
 
 def build_vit(
     image_size:             int,
@@ -168,6 +264,7 @@ def build_vit(
     attn_drop_rate:         float,
     num_heads:              int,
     num_transformer_layers: int,
+    model_name:             str
     ) -> Model:
     """Build vision transformer."""
 
@@ -178,12 +275,18 @@ def build_vit(
         shape = (image_size, image_size, channels),
         name = 'Input')
 
-    # patch encoder
-    patch_enc = Encoder(
+    patch = Patch(
         patch_size = patch_size,
         hidden_dim = hidden_dim,
-        name       = 'Patch_Encoder'
     )(inputs)
+
+    # patch encoder
+    patch_enc = Encoder(
+        image_size = image_size,
+        patch_size = patch_size,
+        hidden_dim = hidden_dim,
+        name       = 'Encoder'
+    )(patch)
 
     # transformer
     for i in range(num_transformer_layers):
@@ -200,18 +303,18 @@ def build_vit(
     # final
     x = layers.LayerNormalization(
         epsilon = 1e-06,
-        name    = 'Final_layernorm')(patch_enc)
-    x = Pop(name='Final_pop')(x)
+        name    = 'Layer_Norm')(patch_enc)
+    x = MLPHead(name='MLP_Head')(x)
     outputs = layers.Dense(
         units      = classes,
         activation = 'softmax',
         name       = 'Output'
         )(x)
-    model = Model(inputs, outputs)
+    model = Model(inputs, outputs, name = model_name)
 
     return model
 
-# config
+
 vitS_conf = dict(
     patch_size              = 16,
     hidden_dim              = 384,
@@ -239,6 +342,15 @@ vitL_conf = dict(
     num_heads               = 16,
     num_transformer_layers  = 24
 )
+vitH_conf = dict(
+    patch_size              = 16,
+    hidden_dim              = 1280,
+    hidden_dim_mlp          = 5120,
+    mlp_drop_rate           = 0.1,
+    attn_drop_rate          = 0.,
+    num_heads               = 16,
+    num_transformer_layers  = 32
+)
 
 
 def ViT_S16(
@@ -249,6 +361,7 @@ def ViT_S16(
         image_size  = image_size,
         channels    = channels,
         classes     = classes,
+        model_name  = 'ViT_S16',
         **vitS_conf)
 
 
@@ -260,7 +373,8 @@ def ViT_S32(
         image_size  = image_size,
         channels    = channels,
         classes     = classes,
-        **dict(vitS_conf, **{'patch_size':32}))
+        model_name  = 'ViT_S32',
+        **dict(vitS_conf, patch_size = 32))
 
 
 def ViT_B16(
@@ -271,6 +385,7 @@ def ViT_B16(
         image_size  = image_size,
         channels    = channels,
         classes     = classes,
+        model_name  = 'ViT_B16',
         **vitB_conf)
 
 
@@ -282,7 +397,8 @@ def ViT_B32(
         image_size  = image_size,
         channels    = channels,
         classes     = classes,
-        **dict(vitB_conf, **{'patch_size':32}))
+        model_name  = 'ViT_B32',
+        **dict(vitB_conf, patch_size = 32))
 
 
 def ViT_L16(
@@ -293,7 +409,8 @@ def ViT_L16(
         image_size  = image_size,
         channels    = channels,
         classes     = classes,
-        **vitB_conf)
+        model_name  = 'ViT_L16',
+        **vitL_conf)
 
 
 def ViT_L32(
@@ -304,9 +421,34 @@ def ViT_L32(
         image_size  = image_size,
         channels    = channels,
         classes     = classes,
-        **dict(vitL_conf, **{'patch_size':32}))
+        model_name  = 'ViT_L32',
+        **dict(vitL_conf, patch_size = 32))
+
+
+def ViT_H16(
+    image_size: int,
+    channels:   int,
+    classes:    int) -> Model:
+    return build_vit(
+        image_size  = image_size,
+        channels    = channels,
+        classes     = classes,
+        model_name  = 'ViT_H16',
+        **vitH_conf)
+
+
+def ViT_H32(
+    image_size: int,
+    channels:   int,
+    classes:    int) -> Model:
+    return build_vit(
+        image_size  = image_size,
+        channels    = channels,
+        classes     = classes,
+        model_name  = 'ViT_H32',
+        **dict(vitH_conf, patch_size = 32))
 
 
 if not __debug__:
-    model = ViT_L32(256, 3, 20)
+    model = ViT_H32(256, 3, 8)
     model.summary()
